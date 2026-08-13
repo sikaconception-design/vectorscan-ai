@@ -642,10 +642,11 @@ main{padding:80px 24px 60px;max-width:1200px;margin:0 auto;position:relative;z-i
   border-top:1px solid var(--border);
   padding:8px 0 max(8px,env(safe-area-inset-bottom));
 }
-.mobile-nav-tabs{display:flex;justify-content:space-around;width:100%}
-.mobile-nav-tab{display:flex;flex-direction:column;align-items:center;gap:3px;
-  padding:6px 10px;border:none;background:transparent;color:var(--muted);cursor:pointer;
-  font-family:var(--font-head);font-size:9px;font-weight:600;min-width:52px;
+.mobile-nav-tabs{display:flex;justify-content:flex-start;width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding:0 4px}
+.mobile-nav-tabs::-webkit-scrollbar{display:none}
+.mobile-nav-tab{display:flex;flex-direction:column;align-items:center;gap:3px;flex:0 0 auto;
+  padding:6px 8px;border:none;background:transparent;color:var(--muted);cursor:pointer;
+  font-family:var(--font-head);font-size:9px;font-weight:600;min-width:46px;white-space:nowrap;
   border-radius:8px;transition:all .2s}
 .mobile-nav-tab i{font-size:18px}
 .mobile-nav-tab.active,.mobile-nav-tab:hover{color:var(--accent);background:rgba(0,232,122,.1)}
@@ -2291,7 +2292,10 @@ function showSection(id, btn) {
   const mobileIdxMap={scan:0,collection:1,database:2,map:3,stats:4,socio:5,chat:6,profile:7,users:8};
   const mIdx=mobileIdxMap[id];
   const mobileTabs=document.querySelectorAll('.mobile-nav-tab');
-  if(mIdx!==undefined && mobileTabs[mIdx]) mobileTabs[mIdx].classList.add('active');
+  if(mIdx!==undefined && mobileTabs[mIdx]){
+    mobileTabs[mIdx].classList.add('active');
+    mobileTabs[mIdx].scrollIntoView({behavior:'smooth', inline:'center', block:'nearest'});
+  }
   // Render section content
   if(id==='collection') renderCollection();
   if(id==='database') renderDB();
