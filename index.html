@@ -19,6 +19,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <style>
 :root{
   --bg:#ffffff;--bg2:#f4f9f6;--bg3:#eaf3ee;--card:#ffffff;--border:#d9e8de;
@@ -1137,6 +1138,15 @@ main{padding:80px 24px 60px;max-width:1200px;margin:0 auto;position:relative;z-i
             <input class="auth-input" id="reg-user" type="text" placeholder="ex : kyao2025">
             <div class="auth-input-focus-bar"></div>
           </div>
+        </div>
+        <div class="auth-field">
+          <label class="auth-label">Email</label>
+          <div class="auth-input-wrap">
+            <i class="fa fa-envelope auth-input-icon"></i>
+            <input class="auth-input" id="reg-email" type="email" placeholder="ex : kyao@exemple.com" autocomplete="email">
+            <div class="auth-input-focus-bar"></div>
+          </div>
+          <span style="font-size:10px;color:rgba(39,51,43,.55);font-family:var(--font-mono)">Un lien de confirmation vous sera envoyé à cette adresse.</span>
         </div>
         <div class="auth-field">
           <label class="auth-label">Mot de passe</label>
@@ -6395,6 +6405,29 @@ function showToast(msg,type='s'){
 // ======================== AUTH — SHA-256 (sécurisé) ========================
 const USERS_KEY = 'vectorscan_users';
 const SESSION_KEY = 'vectorscan_session';
+
+// ======================== SUPABASE (activation de compte par email) ========================
+const SUPABASE_URL = 'https://szmrptfyxntkrftpimfb.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_eQxrjK5dB-kWpSqAcTBVIA_saNImr71';
+const supa = (window.supabase && window.supabase.createClient)
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY)
+  : null;
+
+// Détecte le retour depuis le lien de confirmation reçu par email et informe l'utilisateur.
+function initEmailActivationHandling(){
+  if(!supa) return;
+  const url = new URL(window.location.href);
+  const cameFromEmailLink = url.searchParams.has('code') || window.location.hash.includes('access_token') || url.searchParams.get('type')==='signup';
+  supa.auth.onAuthStateChange((event)=>{
+    if(event === 'SIGNED_IN' && cameFromEmailLink){
+      showToast('Email confirmé — votre compte est activé, vous pouvez vous connecter. ✅', 's');
+      // Nettoie l'URL (retire les jetons) sans recharger la page
+      window.history.replaceState({}, document.title, window.location.pathname);
+      // On ne garde pas de session Supabase active côté navigateur (l'app gère sa propre session locale)
+      supa.auth.signOut().catch(()=>{});
+    }
+  });
+}
 const REMEMBER_KEY = 'vectorscan_last_id';
 const REMEMBER_PASS_KEY = 'vectorscan_last_pass';
 
@@ -7139,6 +7172,20 @@ async function doLogin(){
     setSubmitLoading('#form-login .auth-submit', false);
     setErr('Identifiant ou mot de passe incorrect.'); return;
   }
+  // Vérifie que le compte a bien été activé via le lien reçu par email
+  if(supa && users[user].email){
+    const { error: supaErr } = await supa.auth.signInWithPassword({ email: users[user].email, password: pass });
+    if(supaErr){
+      setSubmitLoading('#form-login .auth-submit', false);
+      if(/email not confirmed/i.test(supaErr.message)){
+        setErr("Compte non activé. Vérifiez votre boîte mail (et vos spams) et cliquez sur le lien de confirmation reçu à l'inscription.");
+      } else {
+        setErr('Identifiant ou mot de passe incorrect.');
+      }
+      return;
+    }
+    supa.auth.signOut().catch(()=>{});
+  }
   saveSession(user);
   rememberId(user);
   migrateLegacyUserData();
@@ -7154,33 +7201,66 @@ async function doLogin(){
 async function doRegister(){
   const name  = document.getElementById('reg-name').value.trim();
   const user  = document.getElementById('reg-user').value.trim();
+  const email = document.getElementById('reg-email').value.trim();
   const pass  = document.getElementById('reg-pass').value;
   const pass2 = document.getElementById('reg-pass2').value;
   const referralInput = (document.getElementById('reg-admin-code')?.value || '').trim();
   const err   = document.getElementById('register-error');
   err.classList.remove('show');
-  if(!name || !user || !pass || !pass2){ err.textContent='Veuillez remplir tous les champs.'; err.classList.add('show'); return; }
+  if(!name || !user || !email || !pass || !pass2){ err.textContent='Veuillez remplir tous les champs.'; err.classList.add('show'); return; }
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){ err.textContent='Adresse email invalide.'; err.classList.add('show'); return; }
   if(pass !== pass2){ err.textContent='Les mots de passe ne correspondent pas.'; err.classList.add('show'); return; }
   if(pass.length < 6){ err.textContent='Le mot de passe doit contenir au moins 6 caractères.'; err.classList.add('show'); return; }
   const users = getUsers();
   if(users[user]){ err.textContent='Cet identifiant est déjà utilisé.'; err.classList.add('show'); return; }
+  const emailTaken = Object.values(users).some(u=>u.email && u.email.toLowerCase()===email.toLowerCase());
+  if(emailTaken){ err.textContent='Cette adresse email est déjà associée à un compte.'; err.classList.add('show'); return; }
   let referrerId = null;
   if(referralInput){
     referrerId = findReferrer(users, referralInput);
     if(!referrerId){ err.textContent='Code de parrainage invalide. Laissez le champ vide pour créer un compte administrateur.'; err.classList.add('show'); return; }
   }
   setSubmitLoading('#form-register .auth-submit', true);
+
+  // Crée le compte côté Supabase : déclenche l'envoi automatique de l'email de confirmation
+  if(supa){
+    const { error: supaErr } = await supa.auth.signUp({
+      email, password: pass,
+      options: { data: { username: user, name }, emailRedirectTo: window.location.origin + window.location.pathname }
+    });
+    if(supaErr){
+      setSubmitLoading('#form-register .auth-submit', false);
+      const msg = /already registered|already exists/i.test(supaErr.message)
+        ? 'Cette adresse email est déjà associée à un compte.'
+        : "Impossible d'envoyer l'email de confirmation : " + supaErr.message;
+      err.textContent = msg; err.classList.add('show');
+      return;
+    }
+  }
+
   await new Promise(r=>setTimeout(r,320));
   const hashed = await hashPassword(pass);
   const grantedAdmin = !referralInput;
   users[user] = {
-    name, pass: hashed, hashv: 2,
+    name, email, pass: hashed, hashv: 2,
     role: grantedAdmin ? 'admin' : 'collecteur',
     referralCode: grantedAdmin ? generateReferralCode(users) : null,
     referredBy: grantedAdmin ? null : referrerId,
     birthdate: '', city: '', education: ''
   };
   saveUsers(users);
+  setSubmitLoading('#form-register .auth-submit', false);
+
+  if(supa){
+    // Compte créé mais verrouillé tant que l'email n'est pas confirmé : pas de connexion automatique
+    switchAuthTab('login');
+    const loginUserEl = document.getElementById('login-user');
+    if(loginUserEl) loginUserEl.value = user;
+    showToast(`Compte créé ! Un email de confirmation a été envoyé à ${email}. Cliquez sur le lien reçu pour activer votre compte avant de vous connecter.`, 's');
+    return;
+  }
+
+  // Repli si Supabase n'est pas disponible : comportement d'origine (connexion immédiate)
   saveSession(user);
   rememberId(user);
   loadUserData();
@@ -8440,6 +8520,7 @@ function initI18n(){
 // ======================== INIT ========================
 (function initAuth(){
   registerServiceWorker();
+  initEmailActivationHandling();
   initOfflineDetection();
   initI18n();
   const session = getSession();
