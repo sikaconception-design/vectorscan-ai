@@ -2304,7 +2304,7 @@ function showSection(id, btn) {
   if(id==='socio') renderSocioList();
   if(id==='chat') renderChat();
   if(id==='profile') renderProfile();
-  if(id==='users') renderUsersAdmin();
+  if(id==='users'){ renderUsersAdmin(); if(typeof syncTeamFromSupabase==='function'){ syncTeamFromSupabase().then(renderUsersAdmin); } }
 }
 
 // ======================== GPS ========================
@@ -6487,6 +6487,58 @@ function findReferrer(users, code){
   return id || null;
 }
 
+// ── Versions Supabase (source de vérité, valables quel que soit l'appareil) ──
+async function findReferrerSupabase(code){
+  const norm = (code||'').trim().toUpperCase();
+  if(!norm || !supa) return null;
+  const { data } = await supa.from('profiles').select('username').eq('referral_code', norm).maybeSingle();
+  return data ? data.username : null;
+}
+async function isUsernameTakenSupabase(username){
+  if(!supa) return false;
+  const { data } = await supa.from('profiles').select('username').eq('username', username).maybeSingle();
+  return !!data;
+}
+async function isEmailTakenSupabase(email){
+  if(!supa) return false;
+  const { data } = await supa.from('profiles').select('username').ilike('email', email).maybeSingle();
+  return !!data;
+}
+async function generateReferralCodeSupabase(){
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const gen = () => 'VS-' + Array.from({length:4},()=>chars[Math.floor(Math.random()*chars.length)]).join('')
+                   + '-' + Array.from({length:4},()=>chars[Math.floor(Math.random()*chars.length)]).join('');
+  if(!supa) return gen();
+  let code;
+  for(let i=0;i<8;i++){
+    code = gen();
+    const { data } = await supa.from('profiles').select('username').eq('referral_code', code).maybeSingle();
+    if(!data) return code;
+  }
+  return code;
+}
+// Récupère l'équipe (soi-même + collecteurs parrainés) depuis Supabase et met à jour
+// le cache local, pour que le panneau d'administration reflète l'état réel quel que
+// soit l'appareil où chaque membre s'est inscrit.
+async function syncTeamFromSupabase(){
+  if(!supa) return;
+  const me = getSession();
+  if(!me) return;
+  const { data, error } = await supa.from('profiles').select('*').or(`username.eq.${me},referred_by.eq.${me}`);
+  if(error || !data) return;
+  const users = getUsers();
+  data.forEach(row=>{
+    const existing = users[row.username] || {};
+    users[row.username] = {
+      ...existing,
+      name: row.name, email: row.email, role: row.role,
+      referralCode: row.referral_code, referredBy: row.referred_by,
+      birthdate: row.birthdate||'', city: row.city||'', education: row.education||''
+    };
+  });
+  saveUsers(users);
+}
+
 // Attribue un rôle à tout compte qui n'en a pas encore (comptes créés avant cette fonctionnalité,
 // ou tout état incohérent) : par défaut "collecteur" — aucune promotion automatique en administrateur.
 // Seul le bon code administrateur saisi à l'inscription (voir doRegister) donne le rôle admin.
@@ -6932,6 +6984,14 @@ function changeUserRoleAdmin(id, newRole){
   saveUsers(users);
   showToast(`Rôle de ${users[id].name||id} mis à jour : ${ROLE_LABELS[newRole]}`,'s');
   renderUsersAdmin();
+  if(supa){
+    (async()=>{
+      const update = { role: newRole };
+      if(newRole==='admin' && !users[id].referralCode) update.referral_code = users[id].referralCode;
+      const { error } = await supa.from('profiles').update(update).eq('username', id);
+      if(error) showToast("Le changement n'a pas pu être synchronisé en ligne : "+error.message, 'w');
+    })();
+  }
 }
 function deleteUserAdmin(id){
   if(!isAdminRole()) return;
@@ -6942,11 +7002,16 @@ function deleteUserAdmin(id){
   if(users[id].referredBy!==me){ showToast('Ce compte ne fait pas partie de votre équipe','w'); return; }
   const adminCount=Object.values(users).filter(u=>u.role==='admin').length;
   if(users[id].role==='admin' && adminCount<=1){ showToast('Impossible : il doit rester au moins un administrateur','w'); return; }
-  if(!confirm(`Supprimer le compte « ${users[id].name||id} » ?\n\nSes fiches et données déjà enregistrées localement sur cet appareil ne seront pas supprimées, mais le compte ne pourra plus se connecter.`)) return;
+  if(!confirm(`Supprimer le compte « ${users[id].name||id} » ?\n\nSes fiches et données déjà enregistrées localement sur cet appareil ne seront pas supprimées. ${supa?"Le compte sera retiré de votre équipe en ligne (l'identifiant Supabase sous-jacent doit être supprimé séparément depuis le tableau de bord Supabase si besoin).":"Le compte ne pourra plus se connecter sur cet appareil."}`)) return;
   delete users[id];
   saveUsers(users);
   showToast('Compte supprimé','i');
   renderUsersAdmin();
+  if(supa){
+    supa.from('profiles').delete().eq('username', id).then(({error})=>{
+      if(error) showToast("La suppression n'a pas pu être synchronisée en ligne : "+error.message, 'w');
+    });
+  }
 }
 
 // ── Cloisonnement des données par utilisateur ──
@@ -7163,6 +7228,80 @@ async function doLogin(){
   if(!user || !pass){ setErr('Veuillez remplir tous les champs.'); return; }
   setSubmitLoading('#form-login .auth-submit', true);
   await new Promise(r=>setTimeout(r,380));
+
+  if(supa){
+    // 1) Retrouve l'email associé à cet identifiant (source de vérité : Supabase)
+    const { data: profile } = await supa.from('profiles').select('*').eq('username', user).maybeSingle();
+    let email = profile ? profile.email : null;
+    if(!email){
+      // Première connexion possible juste après confirmation, avant création de la fiche "profiles" :
+      // on retombe sur le cache local (créé côté navigateur d'inscription) si disponible.
+      const localUsers = getUsers();
+      email = localUsers[user] ? localUsers[user].email : null;
+    }
+    if(!email){
+      setSubmitLoading('#form-login .auth-submit', false);
+      setErr('Identifiant ou mot de passe incorrect.'); return;
+    }
+    const { data: authData, error: supaErr } = await supa.auth.signInWithPassword({ email, password: pass });
+    if(supaErr){
+      setSubmitLoading('#form-login .auth-submit', false);
+      if(/email not confirmed/i.test(supaErr.message)){
+        setErr("Compte non activé. Vérifiez votre boîte mail (et vos spams) et cliquez sur le lien de confirmation reçu à l'inscription.");
+      } else {
+        setErr('Identifiant ou mot de passe incorrect.');
+      }
+      return;
+    }
+    // 2) Première connexion après confirmation : crée la fiche "profiles" à partir des métadonnées
+    //    fournies à l'inscription (username, rôle, code de parrainage, parrain).
+    if(!profile){
+      const meta = authData.user.user_metadata || {};
+      const { error: insertErr } = await supa.from('profiles').insert({
+        id: authData.user.id, username: meta.username || user, email,
+        name: meta.name || user, role: meta.role || 'collecteur',
+        referral_code: meta.referral_code || null, referred_by: meta.referred_by || null
+      });
+      if(insertErr && insertErr.code !== '23505'){ // 23505 = déjà créée (ex: reconnexion en parallèle)
+        setSubmitLoading('#form-login .auth-submit', false);
+        setErr("Erreur lors de la création du profil : " + insertErr.message);
+        supa.auth.signOut().catch(()=>{});
+        return;
+      }
+    }
+    // 3) Synchronise le cache local avec la fiche Supabase (source de vérité)
+    const { data: freshProfile } = await supa.from('profiles').select('*').eq('username', user).maybeSingle();
+    const hashed = await hashPassword(pass);
+    const users = getUsers();
+    const existing = users[user] || {};
+    users[user] = {
+      ...existing,
+      name: freshProfile?.name || user, email,
+      pass: hashed, hashv: 2,
+      role: freshProfile?.role || 'collecteur',
+      referralCode: freshProfile?.referral_code || null,
+      referredBy: freshProfile?.referred_by || null,
+      birthdate: freshProfile?.birthdate || existing.birthdate || '',
+      city: freshProfile?.city || existing.city || '',
+      education: freshProfile?.education || existing.education || ''
+    };
+    saveUsers(users);
+    supa.auth.signOut().catch(()=>{});
+
+    saveSession(user);
+    rememberId(user);
+    migrateLegacyUserData();
+    loadUserData();
+    applyRoleUI();
+    const rememberPassEl = document.getElementById('login-remember-pass');
+    if(rememberPassEl && rememberPassEl.checked){ rememberPass(pass); }
+    else{ clearRememberedPass(); }
+    showApp(users[user].name || user, 'welcome');
+    syncTeamFromSupabase().then(()=>{ if(document.getElementById('users-admin-body')) renderUsersAdmin(); });
+    return;
+  }
+
+  // Repli hors-ligne / sans Supabase configuré : comportement d'origine, 100% local
   const users = getUsers();
   if(!users[user]){
     setSubmitLoading('#form-login .auth-submit', false);
@@ -7175,20 +7314,6 @@ async function doLogin(){
   if(users[user].pass !== hashed){
     setSubmitLoading('#form-login .auth-submit', false);
     setErr('Identifiant ou mot de passe incorrect.'); return;
-  }
-  // Vérifie que le compte a bien été activé via le lien reçu par email
-  if(supa && users[user].email){
-    const { error: supaErr } = await supa.auth.signInWithPassword({ email: users[user].email, password: pass });
-    if(supaErr){
-      setSubmitLoading('#form-login .auth-submit', false);
-      if(/email not confirmed/i.test(supaErr.message)){
-        setErr("Compte non activé. Vérifiez votre boîte mail (et vos spams) et cliquez sur le lien de confirmation reçu à l'inscription.");
-      } else {
-        setErr('Identifiant ou mot de passe incorrect.');
-      }
-      return;
-    }
-    supa.auth.signOut().catch(()=>{});
   }
   saveSession(user);
   rememberId(user);
@@ -7215,33 +7340,54 @@ async function doRegister(){
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){ err.textContent='Adresse email invalide.'; err.classList.add('show'); return; }
   if(pass !== pass2){ err.textContent='Les mots de passe ne correspondent pas.'; err.classList.add('show'); return; }
   if(pass.length < 6){ err.textContent='Le mot de passe doit contenir au moins 6 caractères.'; err.classList.add('show'); return; }
-  const users = getUsers();
-  if(users[user]){ err.textContent='Cet identifiant est déjà utilisé.'; err.classList.add('show'); return; }
-  const emailTaken = Object.values(users).some(u=>u.email && u.email.toLowerCase()===email.toLowerCase());
-  if(emailTaken){ err.textContent='Cette adresse email est déjà associée à un compte.'; err.classList.add('show'); return; }
-  let referrerId = null;
-  if(referralInput){
-    referrerId = findReferrer(users, referralInput);
-    if(!referrerId){ err.textContent='Code de parrainage invalide. Laissez le champ vide pour créer un compte administrateur.'; err.classList.add('show'); return; }
-  }
+  if(!/^[a-zA-Z0-9._-]{3,}$/.test(user)){ err.textContent="L'identifiant doit contenir au moins 3 caractères (lettres, chiffres, . _ -)."; err.classList.add('show'); return; }
   setSubmitLoading('#form-register .auth-submit', true);
 
-  // Crée le compte côté Supabase : déclenche l'envoi automatique de l'email de confirmation
   if(supa){
+    const [userTaken, emailTaken] = await Promise.all([isUsernameTakenSupabase(user), isEmailTakenSupabase(email)]);
+    if(userTaken){ setSubmitLoading('#form-register .auth-submit', false); err.textContent='Cet identifiant est déjà utilisé.'; err.classList.add('show'); return; }
+    if(emailTaken){ setSubmitLoading('#form-register .auth-submit', false); err.textContent='Cette adresse email est déjà associée à un compte.'; err.classList.add('show'); return; }
+    let referrerUsername = null;
+    if(referralInput){
+      referrerUsername = await findReferrerSupabase(referralInput);
+      if(!referrerUsername){ setSubmitLoading('#form-register .auth-submit', false); err.textContent='Code de parrainage invalide. Laissez le champ vide pour créer un compte administrateur.'; err.classList.add('show'); return; }
+    }
+    const grantedAdmin = !referralInput;
+
+    // Crée le compte d'authentification côté Supabase : déclenche l'envoi de l'email de confirmation.
+    // Les infos du profil sont passées en métadonnées pour être insérées après la première connexion
+    // confirmée (la ligne "profiles" ne peut être créée qu'une fois authentifié, voir doLogin).
+    const referralCode = grantedAdmin ? await generateReferralCodeSupabase() : null;
     const { error: supaErr } = await supa.auth.signUp({
       email, password: pass,
-      options: { data: { username: user, name }, emailRedirectTo: window.location.origin + window.location.pathname }
+      options: {
+        data: { username: user, name, role: grantedAdmin?'admin':'collecteur', referral_code: referralCode, referred_by: referrerUsername },
+        emailRedirectTo: window.location.origin + window.location.pathname
+      }
     });
+    setSubmitLoading('#form-register .auth-submit', false);
     if(supaErr){
-      setSubmitLoading('#form-register .auth-submit', false);
       const msg = /already registered|already exists/i.test(supaErr.message)
         ? 'Cette adresse email est déjà associée à un compte.'
-        : "Impossible d'envoyer l'email de confirmation : " + supaErr.message;
+        : "Impossible de créer le compte : " + supaErr.message;
       err.textContent = msg; err.classList.add('show');
       return;
     }
+    switchAuthTab('login');
+    const loginUserEl = document.getElementById('login-user');
+    if(loginUserEl) loginUserEl.value = user;
+    showToast(`Compte créé ! Un email de confirmation a été envoyé à ${email}. Cliquez sur le lien reçu pour activer votre compte avant de vous connecter.`, 's');
+    return;
   }
 
+  // Repli hors-ligne / sans Supabase configuré : comportement d'origine, 100% local
+  const users = getUsers();
+  if(users[user]){ setSubmitLoading('#form-register .auth-submit', false); err.textContent='Cet identifiant est déjà utilisé.'; err.classList.add('show'); return; }
+  let referrerId = null;
+  if(referralInput){
+    referrerId = findReferrer(users, referralInput);
+    if(!referrerId){ setSubmitLoading('#form-register .auth-submit', false); err.textContent='Code de parrainage invalide.'; err.classList.add('show'); return; }
+  }
   await new Promise(r=>setTimeout(r,320));
   const hashed = await hashPassword(pass);
   const grantedAdmin = !referralInput;
@@ -7254,17 +7400,6 @@ async function doRegister(){
   };
   saveUsers(users);
   setSubmitLoading('#form-register .auth-submit', false);
-
-  if(supa){
-    // Compte créé mais verrouillé tant que l'email n'est pas confirmé : pas de connexion automatique
-    switchAuthTab('login');
-    const loginUserEl = document.getElementById('login-user');
-    if(loginUserEl) loginUserEl.value = user;
-    showToast(`Compte créé ! Un email de confirmation a été envoyé à ${email}. Cliquez sur le lien reçu pour activer votre compte avant de vous connecter.`, 's');
-    return;
-  }
-
-  // Repli si Supabase n'est pas disponible : comportement d'origine (connexion immédiate)
   saveSession(user);
   rememberId(user);
   loadUserData();
